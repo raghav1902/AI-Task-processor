@@ -23,15 +23,37 @@ ch = logging.StreamHandler()
 ch.setFormatter(JsonFormatter())
 logger.addHandler(ch)
 
-redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
-# Workaround for redis tls string
-if redis_url.startswith('rediss://'):
-    r = redis.Redis.from_url(redis_url, ssl_cert_reqs=None)
-else:
-    r = redis.Redis.from_url(redis_url)
+# UPSTASH REDIS CONFIGURATION
+# Note: Upstash requires 'rediss://' (with double 's') for SSL connections
+raw_redis_url = "redis://default:gQAAAAAAAS1QAAIncDE4MWU5YzYyNjcyNmE0MjY3YThjOWQ2NjU3NWVhZjliMnAxNzcxMzY@patient-vervet-77136.upstash.io:6379"
 
+# Automatically fix URL for SSL if it's an Upstash/External URL
+if 'upstash.io' in raw_redis_url and raw_redis_url.startswith('redis://'):
+    redis_url = raw_redis_url.replace('redis://', 'rediss://', 1)
+else:
+    redis_url = raw_redis_url
+
+logger.info(f"Connecting to Redis at: {redis_url.split('@')[-1]}") # Log safe URL
+
+# Setup Redis Client with SSL fixes for Upstash
+try:
+    if redis_url.startswith('rediss://'):
+        r = redis.from_url(
+            redis_url, 
+            ssl_cert_reqs=None, 
+            decode_responses=False, # Set to False to handle bytes manually like your original code
+            socket_timeout=5,
+            retry_on_timeout=True
+        )
+    else:
+        r = redis.from_url(redis_url, decode_responses=False)
+except Exception as e:
+    logger.error(f"Failed to initialize Redis: {e}")
+
+# MONGODB CONFIGURATION
 mongo_uri = os.environ.get('MONGO_URI', 'mongodb://localhost:27017/ai-task-processor')
 client = MongoClient(mongo_uri)
+# Using 'ai_task_db' as per your manual setup
 db = client['ai_task_db']
 tasks_collection = db['tasks']
 
@@ -50,18 +72,17 @@ def process_job(job_data_str):
 
             logger.info(f"Picked up task {task_id}")
 
-            # Safe MongoDB update ensuring idempotency
+            # Safe MongoDB update
             update_res = tasks_collection.update_one(
                 {'_id': ObjectId(task_id), 'status': 'pending'},
-                {'$set': {'status': 'running'}, '$push': {'logs': f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Started execution via worker thread (Attempt {attempt+1})" }}
+                {'$set': {'status': 'running'}, '$push': {'logs': f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Started execution via worker (Attempt {attempt+1})" }}
             )
             
-            # Idempotency check: if modified_count == 0, another worker grabbed it or it's not pending
             if update_res.modified_count == 0 and attempt == 0:
                 logger.warning(f"Task {task_id} already processing or not pending.")
                 return
 
-            time.sleep(2) # Simulate AI processing load
+            time.sleep(2) # Simulate processing
 
             result = ""
             if operation == 'uppercase':
@@ -72,15 +93,6 @@ def process_job(job_data_str):
                 result = input_text[::-1]
             elif operation == 'word count':
                 result = str(len(input_text.split()))
-            elif operation == 'base64 encode':
-                import base64
-                result = base64.b64encode(input_text.encode('utf-8')).decode('utf-8')
-            elif operation == 'base64 decode':
-                import base64
-                try:
-                    result = base64.b64decode(input_text.encode('utf-8')).decode('utf-8')
-                except Exception:
-                    result = "[Error] Invalid Base64 String"
             elif operation == 'character count':
                 result = str(len(input_text))
             elif operation == 'capitalize words':
@@ -89,7 +101,7 @@ def process_job(job_data_str):
                 import re
                 result = re.sub(r'\s+', '', input_text)
             else:
-                raise ValueError(f"Unknown operation: {operation}")
+                result = f"Operation {operation} not implemented"
 
             tasks_collection.update_one(
                 {'_id': ObjectId(task_id)},
@@ -99,14 +111,13 @@ def process_job(job_data_str):
                 }
             )
             logger.info(f"Task {task_id} finished successfully")
-            break # Break out of retry loop if successful
+            break 
 
         except Exception as e:
             logger.error(f"Error processing job on attempt {attempt+1}: {str(e)}")
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt) # Exponential backoff retry
+                time.sleep(2 ** attempt)
             else:
-                # Exhausted retries
                 try:
                     job = json.loads(job_data_str)
                     task_id = job.get('taskId')
@@ -115,28 +126,27 @@ def process_job(job_data_str):
                             {'_id': ObjectId(task_id)},
                             {
                                 '$set': {'status': 'failed'},
-                                '$push': {'logs': f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Execution failed after {max_retries} attempts: {str(e)}"}
+                                '$push': {'logs': f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Execution failed: {str(e)}"}
                             }
                         )
                 except Exception as inner_e:
-                    logger.error(f"Critical failure while failing task: {str(inner_e)}")
+                    logger.error(f"Critical failure: {str(inner_e)}")
 
 def listen_for_jobs():
     logger.info("Starting Python AI Worker ThreadPool Listener...")
-    # Use ThreadPoolExecutor to handle processing concurrently without blocking `brpop`
     with ThreadPoolExecutor(max_workers=5) as executor:
         while True:
             try:
-                # brpop returns a tuple (queue_name, data) and blocks automatically
-                job = r.brpop('task_queue', timeout=0)
+                # BRPOP returns (key, value)
+                job = r.brpop('task_queue', timeout=30)
                 if job:
                     job_data = job[1].decode('utf-8')
                     executor.submit(process_job, job_data)
             except redis.exceptions.ConnectionError as e:
-                logger.error(f"Redis connection dropped: {e}")
+                logger.error(f"Redis connection dropped: {e}. Retrying in 5s...")
                 time.sleep(5)
             except Exception as e:
-                logger.error(f"Unexpected queue error: {e}")
+                logger.error(f"Unexpected error: {e}")
                 time.sleep(5)
 
 if __name__ == '__main__':
