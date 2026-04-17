@@ -12,21 +12,33 @@ const errorHandler = require('./src/middlewares/errorHandler');
 const logger = require('./src/utils/logger');
 
 const app = express();
+
+// Required for rate limiting to work correctly on Render/Cloud hosting
+app.set('trust proxy', 1);
+
 app.use(express.json());
 app.use(cookieParser());
 app.use(helmet());
-app.use(cors({ origin: true, credentials: true })); // Fixes wildcard credential restriction
 
+// CORS configuration - Allows for cookies/credentials
+app.use(cors({
+  origin: process.env.FRONTEND_URL || true,
+  credentials: true
+}));
+
+// Rate Limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // limit each IP to 100 requests per windowMs
 });
 app.use('/api', limiter);
 
+// Database Connection
 mongoose.connect(process.env.MONGO_URI)
   .then(() => logger.info('Connected to MongoDB'))
   .catch(err => logger.error(`MongoDB connection error: ${err}`));
 
+// Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/tasks', taskRoutes);
 
@@ -35,10 +47,11 @@ app.get('/api/health', (req, res) => {
   res.status(200).json({ status: 'success', message: 'API is healthy' });
 });
 
-// Global Error Handler must be the last middleware
+// Global Error Handler (Must be last)
 app.use(errorHandler);
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+// Listen on Port (Render uses 10000 by default)
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, '0.0.0.0', () => {
   logger.info(`Server running on port ${PORT}`);
 });
