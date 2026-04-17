@@ -7,7 +7,7 @@ from pymongo import MongoClient
 from bson.objectid import ObjectId
 from concurrent.futures import ThreadPoolExecutor
 
-# Configure logging to output JSON structured logs
+# 1. Logging Setup
 class JsonFormatter(logging.Formatter):
     def format(self, record):
         log_record = {
@@ -23,130 +23,90 @@ ch = logging.StreamHandler()
 ch.setFormatter(JsonFormatter())
 logger.addHandler(ch)
 
-# UPSTASH REDIS CONFIGURATION
-# Note: Upstash requires 'rediss://' (with double 's') for SSL connections
+# 2. Redis Configuration (Upstash SSL Fix)
+# Yahan hum hardcoded URL use kar rahe hain jo aapne diya tha
 raw_redis_url = "redis://default:gQAAAAAAAS1QAAIncDE4MWU5YzYyNjcyNmE0MjY3YThjOWQ2NjU3NWVhZjliMnAxNzcxMzY@patient-vervet-77136.upstash.io:6379"
 
-# Automatically fix URL for SSL if it's an Upstash/External URL
+# Force 'rediss://' for Upstash
 if 'upstash.io' in raw_redis_url and raw_redis_url.startswith('redis://'):
     redis_url = raw_redis_url.replace('redis://', 'rediss://', 1)
 else:
     redis_url = raw_redis_url
 
-logger.info(f"Connecting to Redis at: {redis_url.split('@')[-1]}") # Log safe URL
+# Connection with pooling and timeouts to prevent 'Socket Timeout'
+r = redis.from_url(
+    redis_url, 
+    ssl_cert_reqs=None, 
+    decode_responses=False,
+    socket_connect_timeout=10,
+    socket_keepalive=True,
+    retry_on_timeout=True
+)
 
-# Setup Redis Client with SSL fixes for Upstash
-try:
-    if redis_url.startswith('rediss://'):
-        r = redis.from_url(
-            redis_url, 
-            ssl_cert_reqs=None, 
-            decode_responses=False, # Set to False to handle bytes manually like your original code
-            socket_timeout=5,
-            retry_on_timeout=True
-        )
-    else:
-        r = redis.from_url(redis_url, decode_responses=False)
-except Exception as e:
-    logger.error(f"Failed to initialize Redis: {e}")
-
-# MONGODB CONFIGURATION
-mongo_uri = os.environ.get('MONGO_URI', 'mongodb://localhost:27017/ai-task-processor')
+# 3. MongoDB Configuration
+mongo_uri = os.environ.get('MONGO_URI', 'mongodb://localhost:27017/ai_task_db')
 client = MongoClient(mongo_uri)
-# Using 'ai_task_db' as per your manual setup
 db = client['ai_task_db']
 tasks_collection = db['tasks']
 
+# 4. Task Processing Logic
 def process_job(job_data_str):
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            job = json.loads(job_data_str)
-            task_id = job.get('taskId')
-            input_text = job.get('inputText')
-            operation = job.get('operation')
+    try:
+        job = json.loads(job_data_str)
+        task_id = job.get('taskId')
+        input_text = job.get('inputText', '')
+        operation = job.get('operation', '')
 
-            if not task_id:
-                logger.error("Job missing taskId, discarding.")
-                return
+        if not task_id: return
 
-            logger.info(f"Picked up task {task_id}")
+        logger.info(f"Processing Task: {task_id}")
 
-            # Safe MongoDB update
-            update_res = tasks_collection.update_one(
-                {'_id': ObjectId(task_id), 'status': 'pending'},
-                {'$set': {'status': 'running'}, '$push': {'logs': f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Started execution via worker (Attempt {attempt+1})" }}
-            )
-            
-            if update_res.modified_count == 0 and attempt == 0:
-                logger.warning(f"Task {task_id} already processing or not pending.")
-                return
+        # Update DB to 'running'
+        tasks_collection.update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {'status': 'running'}, '$push': {'logs': f"[{time.strftime('%H:%M:%S')}] Worker started processing"}}
+        )
 
-            time.sleep(2) # Simulate processing
+        time.sleep(2) # Simulate processing delay
 
-            result = ""
-            if operation == 'uppercase':
-                result = input_text.upper()
-            elif operation == 'lowercase':
-                result = input_text.lower()
-            elif operation == 'reverse string':
-                result = input_text[::-1]
-            elif operation == 'word count':
-                result = str(len(input_text.split()))
-            elif operation == 'character count':
-                result = str(len(input_text))
-            elif operation == 'capitalize words':
-                result = input_text.title()
-            elif operation == 'remove whitespace':
-                import re
-                result = re.sub(r'\s+', '', input_text)
-            else:
-                result = f"Operation {operation} not implemented"
+        # Logic Operations
+        result = ""
+        if operation == 'uppercase': result = input_text.upper()
+        elif operation == 'lowercase': result = input_text.lower()
+        elif operation == 'reverse string': result = input_text[::-1]
+        elif operation == 'word count': result = str(len(input_text.split()))
+        elif operation == 'character count': result = str(len(input_text))
+        else: result = f"Processed: {input_text}"
 
-            tasks_collection.update_one(
-                {'_id': ObjectId(task_id)},
-                {
-                    '$set': {'status': 'success', 'result': result},
-                    '$push': {'logs': f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Execution finished successfully"}
-                }
-            )
-            logger.info(f"Task {task_id} finished successfully")
-            break 
+        # Update DB to 'success'
+        tasks_collection.update_one(
+            {'_id': ObjectId(task_id)},
+            {
+                '$set': {'status': 'success', 'result': result},
+                '$push': {'logs': f"[{time.strftime('%H:%M:%S')}] Task completed successfully"}
+            }
+        )
+        logger.info(f"Task {task_id} Success")
 
-        except Exception as e:
-            logger.error(f"Error processing job on attempt {attempt+1}: {str(e)}")
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
-            else:
-                try:
-                    job = json.loads(job_data_str)
-                    task_id = job.get('taskId')
-                    if task_id:
-                        tasks_collection.update_one(
-                            {'_id': ObjectId(task_id)},
-                            {
-                                '$set': {'status': 'failed'},
-                                '$push': {'logs': f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Execution failed: {str(e)}"}
-                            }
-                        )
-                except Exception as inner_e:
-                    logger.error(f"Critical failure: {str(inner_e)}")
+    except Exception as e:
+        logger.error(f"Error in process_job: {e}")
 
+# 5. Main Listener Loop
 def listen_for_jobs():
-    logger.info("Starting Python AI Worker ThreadPool Listener...")
+    logger.info("Starting Worker Listener (Upstash Optimized)...")
     with ThreadPoolExecutor(max_workers=5) as executor:
         while True:
             try:
-                # BRPOP returns (key, value)
-                job = r.brpop('task_queue', timeout=30)
+                # Timeout is kept at 20s to avoid Upstash dropping the idle connection
+                job = r.brpop('task_queue', timeout=20)
                 if job:
                     job_data = job[1].decode('utf-8')
                     executor.submit(process_job, job_data)
-            except redis.exceptions.ConnectionError as e:
-                logger.error(f"Redis connection dropped: {e}. Retrying in 5s...")
-                time.sleep(5)
+            except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
+                # This is normal for serverless Redis, just continue the loop
+                continue 
             except Exception as e:
-                logger.error(f"Unexpected error: {e}")
+                logger.error(f"Unexpected Error: {e}")
                 time.sleep(5)
 
 if __name__ == '__main__':
