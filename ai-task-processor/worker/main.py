@@ -32,7 +32,7 @@ else:
 
 mongo_uri = os.environ.get('MONGO_URI', 'mongodb://localhost:27017/ai-task-processor')
 client = MongoClient(mongo_uri)
-db = client.get_database()
+db = client['ai_task_db']
 tasks_collection = db['tasks']
 
 def process_job(job_data_str):
@@ -87,7 +87,7 @@ def process_job(job_data_str):
                 result = input_text.title()
             elif operation == 'remove whitespace':
                 import re
-                result = re.sub(r'\\s+', '', input_text)
+                result = re.sub(r'\s+', '', input_text)
             else:
                 raise ValueError(f"Unknown operation: {operation}")
 
