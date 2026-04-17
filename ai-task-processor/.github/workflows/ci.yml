@@ -1,0 +1,93 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  INFRA_REPO: ${{ secrets.INFRA_REPO_PAT }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Use Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: 18
+    - name: Install and Lint Frontend
+      run: |
+        cd frontend
+        npm ci
+        npm run lint
+
+    - name: Install and Lint Backend
+      run: |
+        cd backend
+        npm ci
+        npm run lint
+
+  build-and-push:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Login to DockerHub
+      uses: docker/login-action@v2
+      with:
+        username: ${{ env.DOCKER_USERNAME }}
+        password: ${{ env.DOCKER_PASSWORD }}
+
+    - name: Build and push Backend
+      uses: docker/build-push-action@v4
+      with:
+        context: ./backend
+        push: true
+        tags: ${{ env.DOCKER_USERNAME }}/ai-task-processor-backend:${{ github.sha }}
+
+    - name: Build and push Worker
+      uses: docker/build-push-action@v4
+      with:
+        context: ./worker
+        push: true
+        tags: ${{ env.DOCKER_USERNAME }}/ai-task-processor-worker:${{ github.sha }}
+
+    - name: Build and push Frontend
+      uses: docker/build-push-action@v4
+      with:
+        context: ./frontend
+        push: true
+        tags: ${{ env.DOCKER_USERNAME }}/ai-task-processor-frontend:${{ github.sha }}
+
+  update-infra:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        repository: 'raghav1902/ai-task-processor-infra'
+        token: ${{ env.INFRA_REPO }}
+        path: infra
+
+    - name: Update Kubernetes Manifests
+      run: |
+        cd infra/k8s
+        sed -i "s|image: .*/ai-task-processor-backend:.*|image: ${{ env.DOCKER_USERNAME }}/ai-task-processor-backend:${{ github.sha }}|g" base/backend.yaml
+        sed -i "s|image: .*/ai-task-processor-worker:.*|image: ${{ env.DOCKER_USERNAME }}/ai-task-processor-worker:${{ github.sha }}|g" base/worker.yaml
+        sed -i "s|image: .*/ai-task-processor-frontend:.*|image: ${{ env.DOCKER_USERNAME }}/ai-task-processor-frontend:${{ github.sha }}|g" base/frontend.yaml
+
+    - name: Commit and Push
+      run: |
+        cd infra
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+        git add .
+        git commit -m "Update image tags to ${{ github.sha }}"
+        git push
